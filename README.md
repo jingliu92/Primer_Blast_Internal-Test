@@ -46,8 +46,8 @@ So these lines are NOT full primer binding sites and biologically meaningless fo
 ## Step 2: Define biological rules
 1. For **primer presence**, require:
 ```
-- alignment length ≥ 90% of primer length
-- mismatches ≤ 2
+- alignment length ≥ 80% of primer length
+- mismatches ≤ 4
 ```
 2. For **Marker (gene)** presence, require:
 ```
