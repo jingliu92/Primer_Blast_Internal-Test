@@ -26,7 +26,7 @@ do
     -evalue 1000 \
     -dust no \
     -soft_masking false \
-    -outfmt "6 qseqid sseqid pident length qlen qstart qend sstart send evalue bitscore" \
+    -outfmt "6 qseqid sseqid pident length qlen qstart qend sstart send evalue bitscore qseq sseq"  \
     -out results/${genome}.tsv
 done
 ```
@@ -65,20 +65,29 @@ So these lines are NOT full primer binding sites and biologically meaningless fo
 parse_primer_hits.py
 
 Parse BLAST tabular output for primer searches and retain
-only biologically meaningful primer binding sites.
+biologically meaningful primer binding sites, including
+alignment sequences.
 
 Expected BLAST outfmt:
-6 qseqid sseqid pident length qlen qstart qend sstart send evalue bitscore
+6 qseqid sseqid pident length qlen qstart qend sstart send evalue bitscore qseq sseq
 
 Filters:
 - alignment length >= 90% of primer length
-- mismatches <= 2   (approximated as qlen - length)
+- mismatches <= 3   (approximated as qlen - length)
+- percent identity >= 30%
 
 Outputs:
-Genome, Primer, Contig, Strand,
-Start, Stop,
-Primer_Length, Align_Length,
+Genome
+Primer
+Contig
+Strand
+Start
+Stop
+Primer_Length
+Align_Length
 Percent_Identity
+Query_Align_Seq
+Subject_Align_Seq
 """
 
 import sys
@@ -109,8 +118,10 @@ with open(blast_file) as fh:
         qlen   = int(cols[4])
         sstart = int(cols[7])
         send   = int(cols[8])
+        qseq   = cols[11]
+        sseq   = cols[12]
 
-        # -------- STRICT FILTERS --------
+        # -------- FILTERS --------
         coverage = length / qlen
         mismatches = qlen - length
 
@@ -120,17 +131,27 @@ with open(blast_file) as fh:
             continue
         if pident < 30.0:
             continue
-        # --------------------------------
+        # -------------------------
 
         strand = "+" if sstart < send else "-"
         start  = min(sstart, send)
         stop   = max(sstart, send)
 
         hits[qseqid].append(
-            (sseqid, strand, start, stop, qlen, length, pident)
+            (
+                sseqid,
+                strand,
+                start,
+                stop,
+                qlen,
+                length,
+                pident,
+                qseq,
+                sseq
+            )
         )
 
-# Print header (report-friendly)
+# Header
 print(
     "Genome",
     "Primer",
@@ -141,11 +162,24 @@ print(
     "Primer_Length",
     "Align_Length",
     "Percent_Identity",
+    "Query_Align_Seq",
+    "Subject_Align_Seq",
     sep="\t"
 )
 
+# Output records
 for primer, records in hits.items():
-    for contig, strand, start, stop, qlen, length, pident in records:
+    for (
+        contig,
+        strand,
+        start,
+        stop,
+        qlen,
+        length,
+        pident,
+        qseq,
+        sseq
+    ) in records:
         print(
             genome_id,
             primer,
@@ -156,6 +190,8 @@ for primer, records in hits.items():
             qlen,
             length,
             f"{pident:.2f}",
+            qseq,
+            sseq,
             sep="\t"
         )
 ```
@@ -177,37 +213,63 @@ awk 'NR==1 || $1!="Genome"' parsed/*.parsed.tsv > all_parsed.tsv
 ```
 ## Step 4: Collapse F/R → gene markers
 **Pair primers + compute amplicon size**
-`nano 2.pair_primers.py`
+` nano 2.all_parsed_advanced.py`
+
 ```
 #!/usr/bin/env python3
 """
-2.pair_primers.py
+all_parsed_advanced.py
 
-From all_parsed.tsv:
-- Pair Fwd + Rev primers
-- Require same genome
-- Require same contig
-- Require opposite strand
-- Compute amplicon size
-- Call marker presence
+Advanced primer pairing from all_parsed.tsv with:
+- relaxed same-contig rule (draft assemblies)
+- amplicon size metadata
+- primer length, alignment length, % identity
+- alignment DNA sequences (query + subject)
+- long-format + wide-format output
+- multiple primer variants per gene
+- QC warnings for multiple loci
 """
 
+import csv
 from collections import defaultdict
 
 INPUT = "all_parsed.tsv"
-MIN_AMP = 100     # adjust if needed
-MAX_AMP = 1500    # adjust if needed
 
+# Outputs
+LONG_OUT = "marker_long.tsv"
+MATRIX_OUT = "marker_matrix.tsv"
+QC_OUT = "marker_qc.tsv"
+
+# Amplicon constraints
+MIN_AMP = 100
+MAX_AMP = 1500
+
+# Store primer hits
 hits = defaultdict(list)
+genomes = set()
+markers = set()
 
-# Read input
+# ----------------------------
+# Read all_parsed.tsv
+# ----------------------------
 with open(INPUT) as f:
-    header = f.readline()
-    for line in f:
-        genome, primer, contig, strand, start, stop, qlen, alen, pid = line.strip().split("\t")
-        start, stop = int(start), int(stop)
+    reader = csv.DictReader(f, delimiter="\t")
+    for row in reader:
+        genome = row["Genome"]
+        primer = row["Primer"]
+        contig = row["Contig"]
+        strand = row["Strand"]
+        start = int(row["Start"])
 
-        # derive marker + direction
+        primer_len = int(row["Primer_Length"])
+        align_len = int(row["Align_Length"])
+        pid = float(row["Percent_Identity"])
+
+        qseq = row["Query_Align_Seq"]
+        sseq = row["Subject_Align_Seq"]
+
+        genomes.add(genome)
+
         if "Fwd" in primer:
             marker = primer.split("Fwd")[0]
             direction = "F"
@@ -217,38 +279,135 @@ with open(INPUT) as f:
         else:
             continue
 
-        hits[(genome, marker)].append(
-            (direction, contig, strand, start, stop)
-        )
+        markers.add(marker)
 
-# Output
-print("Genome", "Marker", "Contig", "Amplicon_Size", sep="\t")
+        hits[(genome, marker)].append({
+            "direction": direction,
+            "primer": primer,
+            "contig": contig,
+            "strand": strand,
+            "start": start,
+            "primer_len": primer_len,
+            "align_len": align_len,
+            "pid": pid,
+            "qseq": qseq,
+            "sseq": sseq
+        })
+
+# ----------------------------
+# Pair primers & collect data
+# ----------------------------
+long_rows = []
+presence = defaultdict(set)
+qc_warnings = []
 
 for (genome, marker), records in hits.items():
-    fwds = [r for r in records if r[0] == "F"]
-    revs = [r for r in records if r[0] == "R"]
+    fwds = [r for r in records if r["direction"] == "F"]
+    revs = [r for r in records if r["direction"] == "R"]
+
+    loci_found = []
 
     for f in fwds:
         for r in revs:
-            _, contig_f, strand_f, start_f, stop_f = f
-            _, contig_r, strand_r, start_r, stop_r = r
-
-            # same contig
-            if contig_f != contig_r:
+            # must be opposite strand
+            if f["strand"] == r["strand"]:
                 continue
 
-            # opposite strand
-            if strand_f == strand_r:
+            amp = abs(f["start"] - r["start"])
+            if not (MIN_AMP <= amp <= MAX_AMP):
                 continue
 
-            # amplicon size
-            amp = abs(start_f - start_r)
+            loci_found.append((f, r, amp))
 
-            if MIN_AMP <= amp <= MAX_AMP:
-                print(genome, marker, contig_f, amp, sep="\t")
-                break
+    if not loci_found:
+        continue
+
+    # Marker is present
+    presence[genome].add(marker)
+
+    # QC: multiple loci
+    if len(loci_found) > 1:
+        qc_warnings.append([
+            genome, marker, "MULTIPLE_LOCI", len(loci_found)
+        ])
+
+    # Long-format rows
+    for f, r, amp in loci_found:
+        long_rows.append([
+            genome,
+            marker,
+            f["primer"],
+            r["primer"],
+            f["contig"],
+            r["contig"],
+            amp,
+            f["primer_len"],
+            f["align_len"],
+            f["pid"],
+            f["qseq"],
+            f["sseq"],
+            r["primer_len"],
+            r["align_len"],
+            r["pid"],
+            r["qseq"],
+            r["sseq"]
+        ])
+
+# ----------------------------
+# Write long-format table
+# ----------------------------
+with open(LONG_OUT, "w", newline="") as f:
+    writer = csv.writer(f, delimiter="\t")
+    writer.writerow([
+        "Genome",
+        "Marker",
+        "Forward_Primer",
+        "Reverse_Primer",
+        "Forward_Contig",
+        "Reverse_Contig",
+        "Amplicon_Size",
+        "F_Primer_Length",
+        "F_Align_Length",
+        "F_Percent_Identity",
+        "F_Query_Align_Seq",
+        "F_Subject_Align_Seq",
+        "R_Primer_Length",
+        "R_Align_Length",
+        "R_Percent_Identity",
+        "R_Query_Align_Seq",
+        "R_Subject_Align_Seq"
+    ])
+    writer.writerows(long_rows)
+
+# ----------------------------
+# Write wide presence/absence matrix
+# ----------------------------
+genomes = sorted(genomes)
+markers = sorted(markers)
+
+with open(MATRIX_OUT, "w", newline="") as f:
+    writer = csv.writer(f, delimiter="\t")
+    writer.writerow(["Genome"] + markers)
+    for genome in genomes:
+        row = [genome]
+        for marker in markers:
+            row.append(1 if marker in presence[genome] else 0)
+        writer.writerow(row)
+
+# ----------------------------
+# Write QC warnings
+# ----------------------------
+with open(QC_OUT, "w", newline="") as f:
+    writer = csv.writer(f, delimiter="\t")
+    writer.writerow(["Genome", "Marker", "Issue", "Count"])
+    writer.writerows(qc_warnings)
+
+print("Generated:")
+print(f"  {LONG_OUT}")
+print(f"  {MATRIX_OUT}")
+print(f"  {QC_OUT}")
 ```
 ```
-python pair_primers.py > marker_calls.tsv
+python all_parsed_advanced.py
 ```
 
